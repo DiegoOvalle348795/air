@@ -1,0 +1,11 @@
+# Tema claro fijo (evita seguir el modo oscuro del sistema)
+[theme]
+base = "light"
+primaryColor = "#0f766e"
+backgroundColor = "#f7f5f2"
+secondaryBackgroundColor = "#ffffff"
+textColor = "#1c1917"
+font = "sans serif"
+
+[browser]
+gatherUsageStats = false

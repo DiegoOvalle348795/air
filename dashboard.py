@@ -8,9 +8,31 @@ from numba import njit
 
 from api import obtener_climas, obtener_todos_vuelos
 from data import cities
+from funciones.estilos import cargar_estilos, tarjeta_riesgo
+from funciones.predicciones import generar_predicciones
+from funciones.procesamiento import crear_df_clima, crear_df_vuelos, resumen_por_aeropuerto, unir_datos
+from funciones.visualizaciones import (
+    dona_niveles,
+    grafica_aerolineas,
+    grafica_retraso_estimado,
+    grafica_riesgo,
+    grafica_trafico_clima,
+    mapa_riesgo,
+)
 
-st.set_page_config(page_title="Dashboard de Vuelos y Clima", layout="wide")
-st.title("Dashboard de Vuelos y Clima")
+st.set_page_config(page_title="Air Risk Monitor", layout="wide")
+cargar_estilos()
+
+st.markdown(
+    """
+    <div class="hero">
+        <h1>Monitoreo de Aviones Cabron</h1>
+        <span class="tagline">Operaciones · México</span>
+        <p>Clima en vivo, tráfico programado y un índice de riesgo por reglas.</p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 
 @njit
@@ -42,7 +64,7 @@ async def fetch_data():
 
 def load_data(force=False):
     if force or "weather" not in st.session_state or "flights" not in st.session_state:
-        with st.spinner("Actualizando datos..."):
+        with st.spinner("Actualizando datos de OpenWeather y AirLabs..."):
             weather, flights = asyncio.run(fetch_data())
             st.session_state.weather = weather
             st.session_state.flights = flights
@@ -51,7 +73,7 @@ def load_data(force=False):
 
 col_a, col_b = st.columns([1, 4])
 with col_a:
-    refresh = st.button("Actualizar datos")
+    refresh = st.button("Actualizar datos", use_container_width=True)
 
 load_data(force=refresh)
 
@@ -62,20 +84,13 @@ last_update = st.session_state.get("last_update")
 if last_update:
     st.caption(f"Última actualización: {time.ctime(last_update)}")
 
-# Mostrar errores de API para que el dashboard no se quede en blanco.
 weather_errors = [w for w in weather_data if isinstance(w, dict) and "error" in w]
 flight_errors = [f for f in flight_data if isinstance(f, dict) and "error" in f]
 
 if weather_errors:
-    st.warning(
-        f"Clima: {len(weather_errors)} ciudades regresaron error. "
-        "Abre el detalle abajo o revisa API_KEY / límite de OpenWeather."
-    )
+    st.warning(f"Clima: {len(weather_errors)} ciudades regresaron error.")
 if flight_errors:
-    st.warning(
-        f"Vuelos: {len(flight_errors)} aeropuertos regresaron error. "
-        "Abre el detalle abajo o revisa AIRLABS_API_KEY / plan (schedules puede estar restringido)."
-    )
+    st.warning(f"Vuelos: {len(flight_errors)} aeropuertos regresaron error.")
 
 if weather_errors or flight_errors:
     with st.expander("Detalle de errores por ciudad", expanded=False):
@@ -84,79 +99,119 @@ if weather_errors or flight_errors:
         for f in flight_errors:
             st.text(f"[Vuelos] {f.get('ciudad', '?')}: {f.get('error', f)}")
 
-valid_weather = [w for w in weather_data if isinstance(w, dict) and "error" not in w]
-df_weather = pd.DataFrame(valid_weather)
+df_weather = crear_df_clima(weather_data)
+df_flights = crear_df_vuelos(flight_data)
+df_merged = unir_datos(df_weather, df_flights)
+df_resumen = resumen_por_aeropuerto(df_weather, df_flights)
+df_pred = generar_predicciones(df_resumen)
 
-flight_records = []
-for f in flight_data:
-    if isinstance(f, dict) and "error" not in f:
-        for r in f.get("rutas", []):
-            flight_records.append(
-                {
-                    "ciudad": f.get("ciudad"),
-                    "iata": f.get("iata"),
-                    "origen": r.get("origen"),
-                    "destino": r.get("destino"),
-                    "aerolinea": r.get("aerolinea"),
-                    "retraso": r.get("retraso") or 0,
-                }
-            )
-
-df_flights = pd.DataFrame(flight_records)
-
-st.subheader("Datos obtenidos")
-col1, col2, col3 = st.columns(3)
-col1.metric("Ciudades con clima", len(df_weather))
-col2.metric("Rutas/vuelos encontrados", len(df_flights))
-col3.metric("Ciudades monitoreadas", len(cities))
-
-with st.expander("Ver datos de clima"):
-    if df_weather.empty:
-        st.info("No hay datos válidos de clima para mostrar.")
-    else:
+if df_weather.empty or df_flights.empty or df_pred.empty:
+    st.error("No se pueden generar predicciones porque falta clima o vuelos. Revisa los desplegables de datos y errores.")
+    with st.expander("Ver datos de clima"):
         st.dataframe(df_weather, use_container_width=True)
+    with st.expander("Ver datos de vuelos"):
+        st.dataframe(df_flights, use_container_width=True)
+    st.stop()
 
-with st.expander("Ver datos de vuelos"):
-    if df_flights.empty:
-        st.info("No hay datos válidos de vuelos para mostrar.")
-    else:
+# Métricas principales
+vuelos_totales = len(df_flights)
+aeropuertos_monitoreados = len(df_pred)
+retraso_promedio = df_flights["retraso"].mean() if not df_flights.empty else 0
+aeropuerto_critico = df_pred.iloc[0]
+riesgo_promedio = df_pred["riesgo"].mean()
+
+m1, m2, m3, m4, m5 = st.columns(5)
+m1.metric("Vuelos monitoreados", f"{vuelos_totales:,}")
+m2.metric("Aeropuertos", aeropuertos_monitoreados)
+m3.metric("Retraso promedio", f"{retraso_promedio:.1f} min")
+m4.metric("Riesgo promedio", f"{riesgo_promedio:.0f}%")
+m5.metric("Más crítico", f"{aeropuerto_critico['iata']} · {aeropuerto_critico['riesgo']}%")
+
+# Estadística con Numba
+if not df_merged.empty:
+    delays_arr = df_merged["retraso"].to_numpy(dtype=np.float64)
+    rain_ind = df_merged.apply(
+        lambda row: 1
+        if ("Rain" in str(row.get("clima", ""))) or (row.get("visibilidad", 99999) < 5000)
+        else 0,
+        axis=1,
+    ).to_numpy(dtype=np.float64)
+    avg_all, avg_bad_weather = compute_delay_stats(delays_arr, rain_ind)
+else:
+    avg_all, avg_bad_weather = 0.0, 0.0
+
+tab1, tab2, tab3, tab4 = st.tabs([
+    "Resumen ejecutivo",
+    "Mapa de riesgo",
+    "Predicciones",
+    "Datos en vivo",
+])
+
+with tab1:
+    st.subheader("Aeropuertos que requieren más atención")
+    col_left, col_right = st.columns([1.1, 1])
+    with col_left:
+        for _, row in df_pred.head(5).iterrows():
+            st.markdown(tarjeta_riesgo(row), unsafe_allow_html=True)
+    with col_right:
+        st.plotly_chart(dona_niveles(df_pred), use_container_width=True)
+        c1, c2 = st.columns(2)
+        c1.metric("Retraso general", f"{avg_all:.2f} min")
+        c2.metric("Retraso con mal clima", f"{avg_bad_weather:.2f} min")
+
+    st.plotly_chart(grafica_riesgo(df_pred), use_container_width=True)
+
+with tab2:
+    st.subheader("Mapa interactivo de riesgo")
+    st.plotly_chart(mapa_riesgo(df_pred), use_container_width=True)
+    st.caption("El tamaño del punto representa el porcentaje de riesgo. El color representa el nivel operativo.")
+
+with tab3:
+    st.subheader("Predicciones operativas por reglas")
+    st.info(
+        "El riesgo y el retraso estimado salen de reglas fijas sobre clima, visibilidad, viento, carga de vuelos y retrasos observados."
+    )
+
+    tabla_pred = df_pred[[
+        "semaforo", "ciudad", "iata", "riesgo", "nivel_operativo",
+        "probabilidad_retraso", "retraso_estimado_min", "total_vuelos",
+        "retraso_promedio", "clima", "visibilidad", "viento_velocidad", "motivo_riesgo",
+    ]].copy()
+    tabla_pred = tabla_pred.rename(columns={
+        "semaforo": "Semáforo",
+        "ciudad": "Ciudad",
+        "iata": "IATA",
+        "riesgo": "Riesgo %",
+        "nivel_operativo": "Nivel operativo",
+        "probabilidad_retraso": "Prob. retraso %",
+        "retraso_estimado_min": "Retraso estimado min",
+        "total_vuelos": "Vuelos",
+        "retraso_promedio": "Retraso promedio",
+        "clima": "Clima",
+        "visibilidad": "Visibilidad",
+        "viento_velocidad": "Viento m/s",
+        "motivo_riesgo": "Motivo",
+    })
+    st.dataframe(tabla_pred, use_container_width=True, hide_index=True)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.plotly_chart(grafica_retraso_estimado(df_pred), use_container_width=True)
+    with col2:
+        st.plotly_chart(grafica_trafico_clima(df_merged), use_container_width=True)
+
+with tab4:
+    st.subheader("Datos en vivo")
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("### Clima")
+        st.dataframe(df_weather, use_container_width=True)
+    with col2:
+        st.markdown("### Vuelos")
         st.dataframe(df_flights, use_container_width=True)
 
-if df_weather.empty or df_flights.empty:
-    st.error("No se pueden generar gráficas porque falta clima o vuelos. Abre los desplegables de arriba para ver qué API no regresó datos.")
-    st.stop()
+    st.markdown("### Aerolíneas")
+    st.plotly_chart(grafica_aerolineas(df_flights), use_container_width=True)
 
-# Unir datos
-required_weather_cols = {"ciudad", "clima", "visibilidad"}
-missing_cols = required_weather_cols - set(df_weather.columns)
-if missing_cols:
-    st.error(f"Faltan columnas de clima: {', '.join(missing_cols)}")
-    st.stop()
-
-df_merged = df_flights.merge(df_weather, on="ciudad", how="left")
-df_merged["visibilidad"] = pd.to_numeric(df_merged["visibilidad"], errors="coerce").fillna(99999)
-df_merged["retraso"] = pd.to_numeric(df_merged["retraso"], errors="coerce").fillna(0)
-
-st.subheader("Análisis de Retrasos y Clima")
-delays_arr = df_merged["retraso"].to_numpy(dtype=np.float64)
-rain_ind = df_merged.apply(
-    lambda row: 1 if ("Rain" in str(row.get("clima", ""))) or (row.get("visibilidad", 99999) < 5000) else 0,
-    axis=1,
-).to_numpy(dtype=np.float64)
-
-avg_all, avg_bad_weather = compute_delay_stats(delays_arr, rain_ind)
-
-col1, col2 = st.columns(2)
-col1.metric("Retraso promedio general", f"{avg_all:.2f} min")
-col2.metric("Retraso prom. mal clima/baja vis.", f"{avg_bad_weather:.2f} min")
-
-st.subheader("Aeropuertos con Mayor Cantidad de Retrasos")
-retrasos_por_aero = df_merged.groupby("iata")["retraso"].mean().sort_values(ascending=False)
-st.bar_chart(retrasos_por_aero)
-
-st.subheader("Tráfico Aéreo y Condiciones Ambientales")
-trafico_por_clima = df_merged.groupby("clima")["iata"].count()
-st.bar_chart(trafico_por_clima)
-
-with st.expander("Ver datos combinados"):
-    st.dataframe(df_merged, use_container_width=True)
+    with st.expander("Ver datos combinados"):
+        st.dataframe(df_merged, use_container_width=True)
