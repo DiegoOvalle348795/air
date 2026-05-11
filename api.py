@@ -9,11 +9,12 @@ API_KEY = os.getenv("API_KEY")
 AIRLABS_API_KEY = os.getenv("AIRLABS_API_KEY")
 
 if API_KEY is None or AIRLABS_API_KEY is None:
-    print("Missing api key values")
-    exit(1)
+    print("Missing api key values. Configure API_KEY and AIRLABS_API_KEY in your .env file.")
 
 
 async def obtener_clima(session, ciudad):
+    if API_KEY is None:
+        return {"ciudad": ciudad["nombre"], "error": "Missing API_KEY"}
     try:
         lat = ciudad["lat"]
         lon = ciudad["lon"]
@@ -27,16 +28,24 @@ async def obtener_clima(session, ciudad):
 
         async with session.get(url) as response:
             data = await response.json()
+            if str(data.get("cod", "200")) not in ("200", "0"):
+                return {
+                    "ciudad": ciudad["nombre"],
+                    "error": data.get("message", str(data)),
+                }
+            main = data.get("main") or {}
+            weather0 = (data.get("weather") or [{}])[0]
+            wind = data.get("wind") or {}
             return {
                 "ciudad": ciudad["nombre"],
-                "temperatura": data["main"]["temp"],
-                "humedad": data["main"]["humidity"],
-                "presion": data["main"]["pressure"],
+                "temperatura": main.get("temp"),
+                "humedad": main.get("humidity"),
+                "presion": main.get("pressure"),
                 "visibilidad": data.get("visibility"),
-                "viento_velocidad": data["wind"]["speed"],
-                "viento_direccion": data["wind"]["deg"],
-                "clima": data["weather"][0]["main"],
-                "descripcion": data["weather"][0]["description"],
+                "viento_velocidad": wind.get("speed"),
+                "viento_direccion": wind.get("deg"),
+                "clima": weather0.get("main"),
+                "descripcion": weather0.get("description"),
             }
 
     except Exception as e:
@@ -108,6 +117,8 @@ async def obtener_vuelos(session, ciudad):
 
 
 async def obtener_vuelos(session, ciudad):
+    if AIRLABS_API_KEY is None:
+        return {"ciudad": ciudad["nombre"], "error": "Missing AIRLABS_API_KEY"}
     try:
         iata = ciudad["iata"]
         url = (
@@ -118,13 +129,23 @@ async def obtener_vuelos(session, ciudad):
 
         async with session.get(url) as response:
             data = await response.json()
-            if "response" not in data:
+            if data.get("error"):
                 return {
                     "ciudad": ciudad["nombre"],
-                    "error": data.get("error", "No data"),
+                    "error": str(data["error"]),
                 }
 
-            rutas = data["response"]
+            rutas = data.get("response")
+            if rutas is None:
+                return {
+                    "ciudad": ciudad["nombre"],
+                    "error": data.get("message", "Sin campo response en la respuesta"),
+                }
+            if not isinstance(rutas, list):
+                return {
+                    "ciudad": ciudad["nombre"],
+                    "error": f"response inesperado: {type(rutas).__name__}",
+                }
 
             return {
                 "ciudad": ciudad["nombre"],
