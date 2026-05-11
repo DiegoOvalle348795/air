@@ -16,6 +16,7 @@ from funciones.procesamiento import (
     crear_df_thingspeak,
     crear_df_vuelos,
     resumen_por_aeropuerto,
+    resumen_sensores_thingspeak,
     unir_datos,
 )
 from funciones.visualizaciones import (
@@ -33,15 +34,15 @@ from funciones.visualizaciones import (
     mapa_riesgo,
 )
 
-st.set_page_config(page_title="Air Risk Monitor", layout="wide")
+st.set_page_config(page_title="Aviones Cabrones", layout="wide")
 cargar_estilos()
 
 st.markdown(
     """
     <div class="hero">
-        <h1>Air Risk Monitor</h1>
+        <h1>Monitoreo de Aviones Cabron</h1>
         <span class="tagline">Operaciones aéreas · clima · sensores · calidad del aire</span>
-        <p>Monitoreo de vuelos, clima, sensores IoT y calidad del aire con cálculo de riesgo por reglas, Numba y aceleración opcional con CuPy/CUDA.</p>
+        <p>Monitoreo de vuelos, clima, sensores IoT y calidad del aire con cálculo de riesgo por reglas.</p>
     </div>
     """,
     unsafe_allow_html=True,
@@ -141,7 +142,8 @@ df_flights = crear_df_vuelos(flight_data)
 df_openaq = crear_df_openaq(openaq_data)
 df_thingspeak = crear_df_thingspeak(thingspeak_data)
 df_merged = unir_datos(df_weather, df_flights)
-df_resumen = resumen_por_aeropuerto(df_weather, df_flights, df_openaq)
+df_resumen = resumen_por_aeropuerto(df_weather, df_flights, df_openaq, df_thingspeak)
+df_sensor_iot = resumen_sensores_thingspeak(df_thingspeak)
 df_pred = generar_predicciones(df_resumen)
 
 if df_weather.empty or df_flights.empty or df_pred.empty:
@@ -164,14 +166,16 @@ aeropuerto_critico = df_pred.iloc[0]
 riesgo_promedio = df_pred["riesgo"].mean()
 mediciones_aq = len(df_openaq)
 lecturas_iot = len(df_thingspeak)
+iot_score_actual = float(df_sensor_iot["iot_score"].iloc[0]) if not df_sensor_iot.empty and "iot_score" in df_sensor_iot else 0
+aq_score_promedio = df_pred["aq_score"].mean() if "aq_score" in df_pred.columns else 0
 
 m1, m2, m3, m4, m5, m6 = st.columns(6)
 m1.metric("Vuelos monitoreados", f"{vuelos_totales:,}")
 m2.metric("Aeropuertos", aeropuertos_monitoreados)
 m3.metric("Retraso promedio", f"{retraso_promedio:.1f} min")
 m4.metric("Riesgo promedio", f"{riesgo_promedio:.0f}%")
-m5.metric("Mediciones OpenAQ", mediciones_aq)
-m6.metric("Lecturas ThingSpeak", lecturas_iot)
+m5.metric("OpenAQ score prom.", f"{aq_score_promedio:.1f}")
+m6.metric("ThingSpeak score", f"{iot_score_actual:.1f}")
 
 # Estadística con Numba
 if not df_merged.empty:
@@ -218,13 +222,15 @@ with tab2:
 with tab3:
     st.subheader("Predicciones operativas por reglas")
     st.info(
-        "No es IA: el riesgo y el retraso estimado salen de reglas fijas sobre clima, visibilidad, viento, carga de vuelos, retrasos observados y calidad del aire."
+        "el riesgo y el retraso estimado salen de reglas fijas sobre clima, visibilidad, viento, carga de vuelos, retrasos observados y calidad del aire."
     )
 
     columnas_pred = [
         "semaforo", "ciudad", "iata", "riesgo", "nivel_operativo",
         "probabilidad_retraso", "retraso_estimado_min", "total_vuelos",
-        "retraso_promedio", "clima", "visibilidad", "viento_velocidad", "pm25", "pm10", "aq_score", "motivo_riesgo",
+        "retraso_promedio", "clima", "visibilidad", "viento_velocidad",
+        "pm25", "pm10", "aq_score", "sensor_temp", "sensor_humedad", "sensor_presion",
+        "sensor_pm25", "sensor_pm10", "sensor_viento", "iot_score", "motivo_riesgo",
     ]
     columnas_pred = [col for col in columnas_pred if col in df_pred.columns]
     tabla_pred = df_pred[columnas_pred].copy()
@@ -243,7 +249,14 @@ with tab3:
         "viento_velocidad": "Viento m/s",
         "pm25": "PM2.5",
         "pm10": "PM10",
-        "aq_score": "Score aire",
+        "aq_score": "Score OpenAQ",
+        "sensor_temp": "Sensor temp",
+        "sensor_humedad": "Sensor humedad",
+        "sensor_presion": "Sensor presión",
+        "sensor_pm25": "Sensor PM2.5",
+        "sensor_pm10": "Sensor PM10",
+        "sensor_viento": "Sensor viento",
+        "iot_score": "Score ThingSpeak",
         "motivo_riesgo": "Motivo",
     })
     st.dataframe(tabla_pred, use_container_width=True, hide_index=True)
@@ -261,19 +274,50 @@ with tab3:
         st.plotly_chart(grafica_rutas_frecuentes(df_flights), use_container_width=True)
 
 with tab4:
-    st.subheader("Sensores IoT, calidad del aire y aceleración CUDA/CuPy")
+    st.subheader("Sensores IoT, calidad del aire")
 
-    st.markdown("### OpenAQ · calidad del aire")
-    st.caption("OpenAQ se consulta por estaciones cercanas a cada aeropuerto usando coordenadas y radio de búsqueda.")
+    st.info(
+        "meti lo del cuda aqui porque no quise hacer otra pestaña, de todos modos no funciona en mi MACBOOK PRO M5 de 40,000 pesos mexicanos"
+    )
+
+    st.markdown("### OpenAQ · estaciones cercanas a aeropuertos")
+    st.caption(
+        "por cada aeropuerto se busca una estación cercana con lat/lon; después se extraen contaminantes "
+        "como PM2.5, PM10, O3, NO2, SO2 o CO. Con esos valores se calcula `aq_score`, que se suma al riesgo."
+    )
     c1, c2 = st.columns([1.1, 1])
     with c1:
         st.plotly_chart(grafica_calidad_aire_openaq(df_openaq), use_container_width=True)
     with c2:
         st.plotly_chart(mapa_calidad_aire(df_openaq), use_container_width=True)
 
-    st.markdown("### ThingSpeak · sensores ambientales")
-    st.caption("ThingSpeak permite leer sensores propios o canales públicos. Por defecto usa el canal público 9 si no configuras otro.")
+    columnas_aq = [c for c in ["ciudad", "iata", "parametro", "valor", "unidad", "location_name", "fecha_local"] if c in df_openaq.columns]
+    if columnas_aq:
+        with st.expander("Ver mediciones OpenAQ usadas en el score"):
+            st.dataframe(df_openaq[columnas_aq].sort_values(["ciudad", "parametro"]), use_container_width=True, hide_index=True)
+
+    st.markdown("### ThingSpeak · sensores ambientales del canal")
+    st.caption(
+        "se toma la lectura más reciente del canal y se detectan campos como temperatura, humedad, presión, "
+        "PM2.5, PM10, luz o viento. Con eso se calcula `iot_score`, que también entra al riesgo."
+    )
+
+    sensor_row = df_sensor_iot.iloc[0].to_dict() if not df_sensor_iot.empty else {}
+    s1, s2, s3, s4, s5, s6 = st.columns(6)
+    s1.metric("IoT score", f"{sensor_row.get('iot_score', 0):.1f}")
+    s2.metric("Temp sensor", f"{sensor_row.get('sensor_temp', 0):.1f}")
+    s3.metric("Humedad", f"{sensor_row.get('sensor_humedad', 0):.1f}")
+    s4.metric("Presión", f"{sensor_row.get('sensor_presion', 0):.1f}")
+    s5.metric("PM2.5", f"{sensor_row.get('sensor_pm25', 0):.1f}")
+    s6.metric("Viento", f"{sensor_row.get('sensor_viento', 0):.1f}")
+    st.caption(f"Motivo ThingSpeak: {sensor_row.get('iot_motivo', 'sin datos')} · Canal: {sensor_row.get('iot_channel', 'N/D')}")
     st.plotly_chart(grafica_thingspeak_series(df_thingspeak), use_container_width=True)
+
+    with st.expander("Ver tabla ThingSpeak y resumen usado"):
+        st.markdown("**Resumen que entra al score:**")
+        st.dataframe(df_sensor_iot, use_container_width=True, hide_index=True)
+        st.markdown("**Lecturas del canal:**")
+        st.dataframe(df_thingspeak, use_container_width=True, hide_index=True)
 
     st.markdown("### CUDA / CuPy")
     st.caption("Si CuPy y una GPU NVIDIA CUDA están disponibles, estas métricas se calculan en GPU; si no, el sistema usa NumPy como respaldo para no romper el dashboard.")

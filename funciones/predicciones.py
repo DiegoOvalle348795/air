@@ -37,6 +37,15 @@ def calcular_riesgo(row):
     pm25 = _num(row, "pm25", 0)
     pm10 = _num(row, "pm10", 0)
 
+    # Datos de sensores IoT desde ThingSpeak.
+    # Estos campos pueden venir de un canal propio o público.
+    iot_score = _num(row, "iot_score", 0)
+    sensor_temp = _num(row, "sensor_temp", 0)
+    sensor_humedad = _num(row, "sensor_humedad", 0)
+    sensor_pm25 = _num(row, "sensor_pm25", 0)
+    sensor_pm10 = _num(row, "sensor_pm10", 0)
+    sensor_viento = _num(row, "sensor_viento", 0)
+
     if any(x in clima for x in ["thunderstorm", "storm"]):
         riesgo += 30
         motivos.append("tormenta")
@@ -105,18 +114,39 @@ def calcular_riesgo(row):
         riesgo += 8
         motivos.append("retrasos extremos")
 
-    # Calidad del aire: no cancela vuelos por sí sola, pero puede elevar la alerta ambiental.
+    # OpenAQ: calidad del aire por estaciones cercanas al aeropuerto.
+    # No cancela vuelos por sí sola, pero sí eleva la alerta ambiental/operativa.
     if aq_score >= 40:
         riesgo += 12
-        motivos.append("calidad del aire comprometida")
+        motivos.append("OpenAQ: calidad del aire comprometida")
     elif aq_score >= 20:
         riesgo += 6
-        motivos.append("contaminantes moderados")
+        motivos.append("OpenAQ: contaminantes moderados")
 
     if pm25 >= 35:
-        motivos.append("PM2.5 elevado")
+        motivos.append("OpenAQ: PM2.5 elevado")
     if pm10 >= 80:
-        motivos.append("PM10 elevado")
+        motivos.append("OpenAQ: PM10 elevado")
+
+    # ThingSpeak: lectura más reciente del canal de sensores IoT.
+    # El score ya resume temperatura, humedad, presión, PM, viento, etc.
+    if iot_score >= 25:
+        riesgo += 12
+        motivos.append("ThingSpeak: sensores en alerta")
+    elif iot_score >= 10:
+        riesgo += 6
+        motivos.append("ThingSpeak: sensores moderados")
+
+    if sensor_viento >= 14:
+        motivos.append("ThingSpeak: viento fuerte")
+    if sensor_pm25 >= 35:
+        motivos.append("ThingSpeak: PM2.5 alto")
+    if sensor_pm10 >= 80:
+        motivos.append("ThingSpeak: PM10 alto")
+    if sensor_temp >= 38 or (sensor_temp > 0 and sensor_temp <= 3):
+        motivos.append("ThingSpeak: temperatura extrema")
+    if sensor_humedad >= 90:
+        motivos.append("ThingSpeak: humedad muy alta")
 
     riesgo = int(min(round(riesgo), 100))
     if not motivos:
@@ -140,8 +170,11 @@ def estimar_retraso(row, riesgo):
     """
     retraso_promedio = _num(row, "retraso_promedio", 0)
     total_vuelos = _num(row, "total_vuelos", 0)
+    iot_score = _num(row, "iot_score", 0)
+    aq_score = _num(row, "aq_score", 0)
     extra_trafico = 5 if total_vuelos >= 45 else 2 if total_vuelos >= 20 else 0
-    return int(round(3 + (0.35 * riesgo) + (0.25 * retraso_promedio) + extra_trafico))
+    extra_ambiental = 3 if (iot_score >= 25 or aq_score >= 40) else 1 if (iot_score >= 10 or aq_score >= 20) else 0
+    return int(round(3 + (0.35 * riesgo) + (0.25 * retraso_promedio) + extra_trafico + extra_ambiental))
 
 
 def generar_predicciones(df_resumen):
