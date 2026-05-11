@@ -2,21 +2,34 @@ import asyncio
 import time
 
 import numpy as np
-import pandas as pd
 import streamlit as st
 from numba import njit
 
-from api import obtener_climas, obtener_todos_vuelos
+from api import obtener_climas, obtener_openaq_ciudades, obtener_thingspeak, obtener_todos_vuelos
 from data import cities
+from funciones.aceleracion_gpu import metricas_numericas_aceleradas
 from funciones.estilos import cargar_estilos, tarjeta_riesgo
 from funciones.predicciones import generar_predicciones
-from funciones.procesamiento import crear_df_clima, crear_df_vuelos, resumen_por_aeropuerto, unir_datos
+from funciones.procesamiento import (
+    crear_df_clima,
+    crear_df_openaq,
+    crear_df_thingspeak,
+    crear_df_vuelos,
+    resumen_por_aeropuerto,
+    unir_datos,
+)
 from funciones.visualizaciones import (
     dona_niveles,
     grafica_aerolineas,
+    grafica_calidad_aire_openaq,
+    grafica_estados_vuelo,
     grafica_retraso_estimado,
     grafica_riesgo,
+    grafica_rutas_frecuentes,
+    grafica_thingspeak_series,
     grafica_trafico_clima,
+    indicador_gpu,
+    mapa_calidad_aire,
     mapa_riesgo,
 )
 
@@ -26,9 +39,9 @@ cargar_estilos()
 st.markdown(
     """
     <div class="hero">
-        <h1>Monitoreo de Aviones Cabron</h1>
-        <span class="tagline">Operaciones · México</span>
-        <p>Clima en vivo, tráfico programado y un índice de riesgo por reglas.</p>
+        <h1>Air Risk Monitor</h1>
+        <span class="tagline">Operaciones aéreas · clima · sensores · calidad del aire</span>
+        <p>Monitoreo de vuelos, clima, sensores IoT y calidad del aire con cálculo de riesgo por reglas, Numba y aceleración opcional con CuPy/CUDA.</p>
     </div>
     """,
     unsafe_allow_html=True,
@@ -57,17 +70,27 @@ def compute_delay_stats(delays, rain_indicators):
 
 
 async def fetch_data():
-    weather = await obtener_climas(cities)
-    flights = await obtener_todos_vuelos(cities)
-    return weather, flights
+    weather_task = obtener_climas(cities)
+    flights_task = obtener_todos_vuelos(cities)
+    openaq_task = obtener_openaq_ciudades(cities)
+    thingspeak_task = obtener_thingspeak()
+    weather, flights, openaq, thingspeak = await asyncio.gather(
+        weather_task,
+        flights_task,
+        openaq_task,
+        thingspeak_task,
+    )
+    return weather, flights, openaq, thingspeak
 
 
 def load_data(force=False):
     if force or "weather" not in st.session_state or "flights" not in st.session_state:
-        with st.spinner("Actualizando datos de OpenWeather y AirLabs..."):
-            weather, flights = asyncio.run(fetch_data())
+        with st.spinner("Actualizando APIs: OpenWeather, AirLabs, OpenAQ y ThingSpeak..."):
+            weather, flights, openaq, thingspeak = asyncio.run(fetch_data())
             st.session_state.weather = weather
             st.session_state.flights = flights
+            st.session_state.openaq = openaq
+            st.session_state.thingspeak = thingspeak
             st.session_state.last_update = time.time()
 
 
@@ -79,6 +102,8 @@ load_data(force=refresh)
 
 weather_data = st.session_state.get("weather", [])
 flight_data = st.session_state.get("flights", [])
+openaq_data = st.session_state.get("openaq", [])
+thingspeak_data = st.session_state.get("thingspeak", {})
 last_update = st.session_state.get("last_update")
 
 if last_update:
@@ -86,23 +111,37 @@ if last_update:
 
 weather_errors = [w for w in weather_data if isinstance(w, dict) and "error" in w]
 flight_errors = [f for f in flight_data if isinstance(f, dict) and "error" in f]
+openaq_errors = [a for a in openaq_data if isinstance(a, dict) and "error" in a]
+thingspeak_error = thingspeak_data.get("error") if isinstance(thingspeak_data, dict) else None
 
 if weather_errors:
-    st.warning(f"Clima: {len(weather_errors)} ciudades regresaron error.")
+    st.warning(f"OpenWeather: {len(weather_errors)} ciudades regresaron error.")
 if flight_errors:
-    st.warning(f"Vuelos: {len(flight_errors)} aeropuertos regresaron error.")
+    st.warning(f"AirLabs: {len(flight_errors)} aeropuertos regresaron error.")
+if openaq_errors:
+    st.warning(f"OpenAQ: {len(openaq_errors)} ciudades sin medición o con error. Revisa OPENAQ_API_KEY / estaciones cercanas.")
+if thingspeak_error:
+    st.warning(f"ThingSpeak: {thingspeak_error}")
 
-if weather_errors or flight_errors:
-    with st.expander("Detalle de errores por ciudad", expanded=False):
+if weather_errors or flight_errors or openaq_errors or thingspeak_error:
+    with st.expander("Detalle de errores por fuente", expanded=False):
         for w in weather_errors:
-            st.text(f"[Clima] {w.get('ciudad', '?')}: {w.get('error', w)}")
+            st.text(f"[OpenWeather] {w.get('ciudad', '?')}: {w.get('error', w)}")
         for f in flight_errors:
-            st.text(f"[Vuelos] {f.get('ciudad', '?')}: {f.get('error', f)}")
+            st.text(f"[AirLabs] {f.get('ciudad', '?')}: {f.get('error', f)}")
+        for a in openaq_errors:
+            st.text(f"[OpenAQ] {a.get('ciudad', '?')}: {a.get('error', a)}")
+        if thingspeak_error:
+            st.text(f"[ThingSpeak] {thingspeak_error}")
+
+# Limpieza y cruce de datos
 
 df_weather = crear_df_clima(weather_data)
 df_flights = crear_df_vuelos(flight_data)
+df_openaq = crear_df_openaq(openaq_data)
+df_thingspeak = crear_df_thingspeak(thingspeak_data)
 df_merged = unir_datos(df_weather, df_flights)
-df_resumen = resumen_por_aeropuerto(df_weather, df_flights)
+df_resumen = resumen_por_aeropuerto(df_weather, df_flights, df_openaq)
 df_pred = generar_predicciones(df_resumen)
 
 if df_weather.empty or df_flights.empty or df_pred.empty:
@@ -111,6 +150,10 @@ if df_weather.empty or df_flights.empty or df_pred.empty:
         st.dataframe(df_weather, use_container_width=True)
     with st.expander("Ver datos de vuelos"):
         st.dataframe(df_flights, use_container_width=True)
+    with st.expander("Ver datos OpenAQ"):
+        st.dataframe(df_openaq, use_container_width=True)
+    with st.expander("Ver datos ThingSpeak"):
+        st.dataframe(df_thingspeak, use_container_width=True)
     st.stop()
 
 # Métricas principales
@@ -119,13 +162,16 @@ aeropuertos_monitoreados = len(df_pred)
 retraso_promedio = df_flights["retraso"].mean() if not df_flights.empty else 0
 aeropuerto_critico = df_pred.iloc[0]
 riesgo_promedio = df_pred["riesgo"].mean()
+mediciones_aq = len(df_openaq)
+lecturas_iot = len(df_thingspeak)
 
-m1, m2, m3, m4, m5 = st.columns(5)
+m1, m2, m3, m4, m5, m6 = st.columns(6)
 m1.metric("Vuelos monitoreados", f"{vuelos_totales:,}")
 m2.metric("Aeropuertos", aeropuertos_monitoreados)
 m3.metric("Retraso promedio", f"{retraso_promedio:.1f} min")
 m4.metric("Riesgo promedio", f"{riesgo_promedio:.0f}%")
-m5.metric("Más crítico", f"{aeropuerto_critico['iata']} · {aeropuerto_critico['riesgo']}%")
+m5.metric("Mediciones OpenAQ", mediciones_aq)
+m6.metric("Lecturas ThingSpeak", lecturas_iot)
 
 # Estadística con Numba
 if not df_merged.empty:
@@ -140,10 +186,13 @@ if not df_merged.empty:
 else:
     avg_all, avg_bad_weather = 0.0, 0.0
 
-tab1, tab2, tab3, tab4 = st.tabs([
+metricas_gpu = metricas_numericas_aceleradas(df_pred, df_flights)
+
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "Resumen ejecutivo",
     "Mapa de riesgo",
     "Predicciones",
+    "Sensores y calidad del aire",
     "Datos en vivo",
 ])
 
@@ -169,14 +218,16 @@ with tab2:
 with tab3:
     st.subheader("Predicciones operativas por reglas")
     st.info(
-        "El riesgo y el retraso estimado salen de reglas fijas sobre clima, visibilidad, viento, carga de vuelos y retrasos observados."
+        "No es IA: el riesgo y el retraso estimado salen de reglas fijas sobre clima, visibilidad, viento, carga de vuelos, retrasos observados y calidad del aire."
     )
 
-    tabla_pred = df_pred[[
+    columnas_pred = [
         "semaforo", "ciudad", "iata", "riesgo", "nivel_operativo",
         "probabilidad_retraso", "retraso_estimado_min", "total_vuelos",
-        "retraso_promedio", "clima", "visibilidad", "viento_velocidad", "motivo_riesgo",
-    ]].copy()
+        "retraso_promedio", "clima", "visibilidad", "viento_velocidad", "pm25", "pm10", "aq_score", "motivo_riesgo",
+    ]
+    columnas_pred = [col for col in columnas_pred if col in df_pred.columns]
+    tabla_pred = df_pred[columnas_pred].copy()
     tabla_pred = tabla_pred.rename(columns={
         "semaforo": "Semáforo",
         "ciudad": "Ciudad",
@@ -190,6 +241,9 @@ with tab3:
         "clima": "Clima",
         "visibilidad": "Visibilidad",
         "viento_velocidad": "Viento m/s",
+        "pm25": "PM2.5",
+        "pm10": "PM10",
+        "aq_score": "Score aire",
         "motivo_riesgo": "Motivo",
     })
     st.dataframe(tabla_pred, use_container_width=True, hide_index=True)
@@ -200,15 +254,54 @@ with tab3:
     with col2:
         st.plotly_chart(grafica_trafico_clima(df_merged), use_container_width=True)
 
+    col3, col4 = st.columns(2)
+    with col3:
+        st.plotly_chart(grafica_estados_vuelo(df_flights), use_container_width=True)
+    with col4:
+        st.plotly_chart(grafica_rutas_frecuentes(df_flights), use_container_width=True)
+
 with tab4:
+    st.subheader("Sensores IoT, calidad del aire y aceleración CUDA/CuPy")
+
+    st.markdown("### OpenAQ · calidad del aire")
+    st.caption("OpenAQ se consulta por estaciones cercanas a cada aeropuerto usando coordenadas y radio de búsqueda.")
+    c1, c2 = st.columns([1.1, 1])
+    with c1:
+        st.plotly_chart(grafica_calidad_aire_openaq(df_openaq), use_container_width=True)
+    with c2:
+        st.plotly_chart(mapa_calidad_aire(df_openaq), use_container_width=True)
+
+    st.markdown("### ThingSpeak · sensores ambientales")
+    st.caption("ThingSpeak permite leer sensores propios o canales públicos. Por defecto usa el canal público 9 si no configuras otro.")
+    st.plotly_chart(grafica_thingspeak_series(df_thingspeak), use_container_width=True)
+
+    st.markdown("### CUDA / CuPy")
+    st.caption("Si CuPy y una GPU NVIDIA CUDA están disponibles, estas métricas se calculan en GPU; si no, el sistema usa NumPy como respaldo para no romper el dashboard.")
+    g1, g2, g3, g4 = st.columns(4)
+    g1.metric("Backend", metricas_gpu.get("backend", "N/D"))
+    g2.metric("Riesgo promedio", f"{metricas_gpu.get('riesgo_promedio', 0):.2f}%")
+    g3.metric("Retraso prom.", f"{metricas_gpu.get('retraso_promedio', 0):.2f} min")
+    g4.metric("Tiempo cálculo", f"{metricas_gpu.get('tiempo_ms', 0):.4f} ms")
+    st.plotly_chart(indicador_gpu(metricas_gpu), use_container_width=True)
+    st.code(metricas_gpu.get("mensaje", "Sin mensaje de GPU"), language="text")
+
+with tab5:
     st.subheader("Datos en vivo")
     col1, col2 = st.columns(2)
     with col1:
-        st.markdown("### Clima")
+        st.markdown("### OpenWeather")
         st.dataframe(df_weather, use_container_width=True)
     with col2:
-        st.markdown("### Vuelos")
+        st.markdown("### AirLabs")
         st.dataframe(df_flights, use_container_width=True)
+
+    col3, col4 = st.columns(2)
+    with col3:
+        st.markdown("### OpenAQ")
+        st.dataframe(df_openaq, use_container_width=True)
+    with col4:
+        st.markdown("### ThingSpeak")
+        st.dataframe(df_thingspeak, use_container_width=True)
 
     st.markdown("### Aerolíneas")
     st.plotly_chart(grafica_aerolineas(df_flights), use_container_width=True)

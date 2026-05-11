@@ -7,9 +7,22 @@ load_dotenv()
 
 API_KEY = os.getenv("API_KEY")
 AIRLABS_API_KEY = os.getenv("AIRLABS_API_KEY")
+OPENAQ_API_KEY = os.getenv("OPENAQ_API_KEY")
+OPENAQ_RADIUS_M = int(os.getenv("OPENAQ_RADIUS_M", "25000"))
+THINGSPEAK_CHANNEL_ID = os.getenv("THINGSPEAK_CHANNEL_ID", "9")
+THINGSPEAK_READ_API_KEY = os.getenv("THINGSPEAK_READ_API_KEY")
+THINGSPEAK_RESULTS = int(os.getenv("THINGSPEAK_RESULTS", "25"))
 
 if API_KEY is None or AIRLABS_API_KEY is None:
     print("Missing api key values. Configure API_KEY and AIRLABS_API_KEY in your .env file.")
+
+
+async def _leer_json(response):
+    try:
+        return await response.json(content_type=None)
+    except Exception:
+        texto = await response.text()
+        return {"error": texto[:500]}
 
 
 async def obtener_clima(session, ciudad):
@@ -27,7 +40,7 @@ async def obtener_clima(session, ciudad):
         )
 
         async with session.get(url) as response:
-            data = await response.json()
+            data = await _leer_json(response)
             if str(data.get("cod", "200")) not in ("200", "0"):
                 return {
                     "ciudad": ciudad["nombre"],
@@ -106,7 +119,7 @@ async def obtener_vuelos(session, ciudad):
         )
 
         async with session.get(url) as response:
-            data = await response.json()
+            data = await _leer_json(response)
             if data.get("error"):
                 return {
                     "ciudad": ciudad["nombre"],
@@ -161,3 +174,170 @@ async def obtener_todos_vuelos(ciudades):
         tareas = [obtener_vuelos(session, ciudad) for ciudad in ciudades]
         resultados = await asyncio.gather(*tareas, return_exceptions=True)
         return resultados
+
+
+def _openaq_headers():
+    headers = {"Accept": "application/json"}
+    if OPENAQ_API_KEY:
+        headers["X-API-Key"] = OPENAQ_API_KEY
+    return headers
+
+
+def _parametro_openaq(registro):
+    """Intenta obtener el nombre del contaminante en respuestas v3 o variantes.
+
+    OpenAQ v3 regresa el valor y sensor; algunas respuestas incluyen el parámetro,
+    otras no. Por eso dejamos un nombre seguro basado en sensorsId si no viene.
+    """
+    for llave in ("parameter", "parameterName", "parameters", "parameter_name"):
+        valor = registro.get(llave)
+        if isinstance(valor, str):
+            return valor.lower()
+        if isinstance(valor, dict):
+            nombre = valor.get("name") or valor.get("displayName") or valor.get("parameter")
+            if nombre:
+                return str(nombre).lower()
+    sensor = registro.get("sensorsId") or registro.get("sensorId") or registro.get("sensor_id")
+    return f"sensor_{sensor}" if sensor is not None else "desconocido"
+
+
+async def obtener_openaq_ciudad(session, ciudad):
+    if OPENAQ_API_KEY is None:
+        return {
+            "ciudad": ciudad["nombre"],
+            "iata": ciudad.get("iata"),
+            "error": "Missing OPENAQ_API_KEY. Crea una key en OpenAQ y agrega OPENAQ_API_KEY al .env",
+        }
+
+    try:
+        lat = ciudad["lat"]
+        lon = ciudad["lon"]
+        headers = _openaq_headers()
+        base = "https://api.openaq.org/v3"
+        params = f"coordinates={lat:.4f},{lon:.4f}&radius={OPENAQ_RADIUS_M}&limit=1"
+        url_locations = f"{base}/locations?{params}"
+
+        async with session.get(url_locations, headers=headers) as response:
+            data_locations = await _leer_json(response)
+            if response.status >= 400:
+                return {
+                    "ciudad": ciudad["nombre"],
+                    "iata": ciudad.get("iata"),
+                    "error": data_locations.get("detail", data_locations.get("error", str(data_locations))),
+                }
+
+        ubicaciones = data_locations.get("results") or []
+        if not ubicaciones:
+            return {
+                "ciudad": ciudad["nombre"],
+                "iata": ciudad.get("iata"),
+                "lat": lat,
+                "lon": lon,
+                "error": f"Sin estaciones OpenAQ en radio de {OPENAQ_RADIUS_M} m",
+            }
+
+        ubicacion = ubicaciones[0]
+        location_id = ubicacion.get("id")
+        location_name = ubicacion.get("name") or ubicacion.get("locality") or f"location_{location_id}"
+        if location_id is None:
+            return {"ciudad": ciudad["nombre"], "iata": ciudad.get("iata"), "error": "Ubicación OpenAQ sin id"}
+
+        url_latest = f"{base}/locations/{location_id}/latest?limit=100"
+        async with session.get(url_latest, headers=headers) as response:
+            data_latest = await _leer_json(response)
+            if response.status >= 400:
+                return {
+                    "ciudad": ciudad["nombre"],
+                    "iata": ciudad.get("iata"),
+                    "location_id": location_id,
+                    "error": data_latest.get("detail", data_latest.get("error", str(data_latest))),
+                }
+
+        mediciones = []
+        for registro in data_latest.get("results") or []:
+            coords = registro.get("coordinates") or {}
+            dt = registro.get("datetime") or {}
+            mediciones.append(
+                {
+                    "ciudad": ciudad["nombre"],
+                    "iata": ciudad.get("iata"),
+                    "location_id": location_id,
+                    "location_name": location_name,
+                    "parametro": _parametro_openaq(registro),
+                    "valor": registro.get("value"),
+                    "unidad": registro.get("unit") or registro.get("units") or "",
+                    "fecha_utc": dt.get("utc") if isinstance(dt, dict) else None,
+                    "fecha_local": dt.get("local") if isinstance(dt, dict) else None,
+                    "sensor_id": registro.get("sensorsId") or registro.get("sensorId"),
+                    "lat": coords.get("latitude", lat),
+                    "lon": coords.get("longitude", lon),
+                }
+            )
+
+        return {
+            "ciudad": ciudad["nombre"],
+            "iata": ciudad.get("iata"),
+            "location_id": location_id,
+            "location_name": location_name,
+            "mediciones": mediciones,
+        }
+    except Exception as e:
+        return {"ciudad": ciudad["nombre"], "iata": ciudad.get("iata"), "error": str(e)}
+
+
+async def obtener_openaq_ciudades(ciudades):
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        tareas = [obtener_openaq_ciudad(session, ciudad) for ciudad in ciudades]
+        resultados = await asyncio.gather(*tareas, return_exceptions=True)
+        return resultados
+
+
+async def obtener_thingspeak():
+    """Lee datos de un canal público o privado de ThingSpeak.
+
+    Variables .env opcionales:
+    - THINGSPEAK_CHANNEL_ID: por defecto 9, canal público de ejemplo.
+    - THINGSPEAK_READ_API_KEY: solo necesario si el canal es privado.
+    - THINGSPEAK_RESULTS: cantidad de lecturas a descargar.
+    """
+    try:
+        params = f"results={THINGSPEAK_RESULTS}"
+        if THINGSPEAK_READ_API_KEY:
+            params += f"&api_key={THINGSPEAK_READ_API_KEY}"
+        url = f"https://api.thingspeak.com/channels/{THINGSPEAK_CHANNEL_ID}/feeds.json?{params}"
+
+        timeout = aiohttp.ClientTimeout(total=25)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url) as response:
+                data = await _leer_json(response)
+                if response.status >= 400:
+                    return {"error": data.get("error", str(data)), "channel_id": THINGSPEAK_CHANNEL_ID}
+
+        channel = data.get("channel") or {}
+        feeds = data.get("feeds") or []
+        field_names = {
+            key: value for key, value in channel.items()
+            if key.startswith("field") and value
+        }
+
+        registros = []
+        for feed in feeds:
+            fila = {
+                "channel_id": THINGSPEAK_CHANNEL_ID,
+                "channel_name": channel.get("name", f"ThingSpeak {THINGSPEAK_CHANNEL_ID}"),
+                "created_at": feed.get("created_at"),
+                "entry_id": feed.get("entry_id"),
+            }
+            for field_key, field_label in field_names.items():
+                fila[field_label] = feed.get(field_key)
+            registros.append(fila)
+
+        return {
+            "channel_id": THINGSPEAK_CHANNEL_ID,
+            "channel_name": channel.get("name", f"ThingSpeak {THINGSPEAK_CHANNEL_ID}"),
+            "field_names": field_names,
+            "registros": registros,
+        }
+    except Exception as e:
+        return {"error": str(e), "channel_id": THINGSPEAK_CHANNEL_ID}

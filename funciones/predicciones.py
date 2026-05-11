@@ -17,6 +17,7 @@ def calcular_riesgo(row):
 
     No es IA ni machine learning. Es una regla de puntaje:
     entre más factores negativos existan, más puntos suma el aeropuerto.
+    Ahora también puede sumar riesgo por calidad del aire desde OpenAQ.
     """
     riesgo = 0
     motivos = []
@@ -32,6 +33,9 @@ def calcular_riesgo(row):
     total_vuelos = _num(row, "total_vuelos", 0)
     retraso_promedio = _num(row, "retraso_promedio", 0)
     retraso_maximo = _num(row, "retraso_maximo", 0)
+    aq_score = _num(row, "aq_score", 0)
+    pm25 = _num(row, "pm25", 0)
+    pm10 = _num(row, "pm10", 0)
 
     if any(x in clima for x in ["thunderstorm", "storm"]):
         riesgo += 30
@@ -85,74 +89,73 @@ def calcular_riesgo(row):
 
     if total_vuelos >= 45:
         riesgo += 16
-        motivos.append("tráfico alto")
+        motivos.append("alto tráfico")
     elif total_vuelos >= 20:
         riesgo += 9
-        motivos.append("tráfico moderado")
-    elif total_vuelos >= 10:
-        riesgo += 4
-        motivos.append("actividad aérea")
+        motivos.append("tráfico medio")
 
-    if retraso_promedio >= 30:
-        riesgo += 24
+    if retraso_promedio >= 25:
+        riesgo += 22
         motivos.append("retraso promedio alto")
-    elif retraso_promedio >= 15:
-        riesgo += 14
+    elif retraso_promedio >= 10:
+        riesgo += 12
         motivos.append("retraso promedio medio")
-    elif retraso_promedio >= 5:
-        riesgo += 6
-        motivos.append("retrasos leves")
 
     if retraso_maximo >= 60:
-        riesgo += 10
-        motivos.append("retraso máximo elevado")
+        riesgo += 8
+        motivos.append("retrasos extremos")
+
+    # Calidad del aire: no cancela vuelos por sí sola, pero puede elevar la alerta ambiental.
+    if aq_score >= 40:
+        riesgo += 12
+        motivos.append("calidad del aire comprometida")
+    elif aq_score >= 20:
+        riesgo += 6
+        motivos.append("contaminantes moderados")
+
+    if pm25 >= 35:
+        motivos.append("PM2.5 elevado")
+    if pm10 >= 80:
+        motivos.append("PM10 elevado")
 
     riesgo = int(min(round(riesgo), 100))
     if not motivos:
         motivos.append("condiciones normales")
-    return riesgo, ", ".join(motivos[:4])
+    return riesgo, ", ".join(motivos[:5])
 
 
 def clasificar_riesgo(riesgo):
     if riesgo >= 70:
-        return "Crítico"
+        return "Crítico", "🔴"
     if riesgo >= 40:
-        return "Precaución"
-    return "Normal"
+        return "Precaución", "🟡"
+    return "Normal", "🟢"
 
 
-def semaforo(nivel):
-    if nivel == "Crítico":
-        return "🔴"
-    if nivel == "Precaución":
-        return "🟡"
-    return "🟢"
+def estimar_retraso(row, riesgo):
+    """Estimación operativa por reglas, no IA.
 
-
-def estimar_retraso(riesgo, retraso_promedio):
+    Fórmula base:
+    retraso estimado = 3 + 0.35 * riesgo + 0.25 * retraso_promedio_observado
     """
-    Estima minutos de retraso a partir del score.
-
-    Fórmula:
-    3 min base + 0.35 * riesgo + 0.25 * retraso promedio actual.
-    """
-    retraso = 3 + (0.35 * riesgo) + (0.25 * float(retraso_promedio or 0))
-    return round(min(retraso, 60), 1)
+    retraso_promedio = _num(row, "retraso_promedio", 0)
+    total_vuelos = _num(row, "total_vuelos", 0)
+    extra_trafico = 5 if total_vuelos >= 45 else 2 if total_vuelos >= 20 else 0
+    return int(round(3 + (0.35 * riesgo) + (0.25 * retraso_promedio) + extra_trafico))
 
 
 def generar_predicciones(df_resumen):
     if df_resumen.empty:
-        return df_resumen
+        return pd.DataFrame()
 
     pred = df_resumen.copy()
-    resultados = pred.apply(calcular_riesgo, axis=1)
-    pred["riesgo"] = [r[0] for r in resultados]
-    pred["motivo_riesgo"] = [r[1] for r in resultados]
-    pred["nivel_operativo"] = pred["riesgo"].apply(clasificar_riesgo)
-    pred["semaforo"] = pred["nivel_operativo"].apply(semaforo)
-    pred["retraso_estimado_min"] = pred.apply(
-        lambda row: estimar_retraso(row["riesgo"], row.get("retraso_promedio", 0)),
-        axis=1,
-    )
+    riesgos = pred.apply(calcular_riesgo, axis=1, result_type="expand")
+    pred["riesgo"] = riesgos[0].astype(int)
+    pred["motivo_riesgo"] = riesgos[1]
+
+    niveles = pred["riesgo"].apply(clasificar_riesgo)
+    pred["nivel_operativo"] = niveles.apply(lambda x: x[0])
+    pred["semaforo"] = niveles.apply(lambda x: x[1])
     pred["probabilidad_retraso"] = pred["riesgo"].astype(int).clip(0, 100)
+    pred["retraso_estimado_min"] = pred.apply(lambda row: estimar_retraso(row, row["riesgo"]), axis=1)
     return pred.sort_values("riesgo", ascending=False)
