@@ -1,13 +1,36 @@
 import os
-import aiohttp
+import ssl
 import asyncio
+from pathlib import Path
+
+import aiohttp
+import certifi
 from dotenv import load_dotenv
 
-load_dotenv()
 
-API_KEY = os.getenv("API_KEY")
-AIRLABS_API_KEY = os.getenv("AIRLABS_API_KEY")
-OPENAQ_API_KEY = os.getenv("OPENAQ_API_KEY")
+def _ssl_connector():
+    """CA bundle de certifi: evita SSLCertVerificationError en macOS/Python.org."""
+    ctx = ssl.create_default_context(cafile=certifi.where())
+    return aiohttp.TCPConnector(ssl=ctx)
+
+# Ruta fija al .env del proyecto: Streamlit/IDE a veces arrancan con otro cwd y
+# load_dotenv() sin argumentos no encuentra el archivo.
+_ROOT = Path(__file__).resolve().parent
+load_dotenv(_ROOT / ".env", encoding="utf-8-sig")
+
+
+def _env_api_key(name: str):
+    """Lee claves de API: None si falta o si el valor es solo espacios (o vacío)."""
+    raw = os.getenv(name)
+    if raw is None:
+        return None
+    stripped = raw.strip()
+    return stripped if stripped else None
+
+
+API_KEY = _env_api_key("API_KEY")
+AIRLABS_API_KEY = _env_api_key("AIRLABS_API_KEY")
+OPENAQ_API_KEY = _env_api_key("OPENAQ_API_KEY")
 OPENAQ_RADIUS_M = int(os.getenv("OPENAQ_RADIUS_M", "25000"))
 THINGSPEAK_CHANNEL_ID = os.getenv("THINGSPEAK_CHANNEL_ID", "9")
 THINGSPEAK_READ_API_KEY = os.getenv("THINGSPEAK_READ_API_KEY")
@@ -85,7 +108,7 @@ async def obtener_clima(session, ciudad):
 
 
 async def obtener_climas(ciudades):
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(connector=_ssl_connector()) as session:
         tareas = [obtener_clima(session, ciudad) for ciudad in ciudades]
         resultados = await asyncio.gather(*tareas, return_exceptions=True)
         return resultados
@@ -170,7 +193,7 @@ async def obtener_vuelos(session, ciudad):
 
 
 async def obtener_todos_vuelos(ciudades):
-    async with aiohttp.ClientSession() as session:
+    async with aiohttp.ClientSession(connector=_ssl_connector()) as session:
         tareas = [obtener_vuelos(session, ciudad) for ciudad in ciudades]
         resultados = await asyncio.gather(*tareas, return_exceptions=True)
         return resultados
@@ -287,7 +310,7 @@ async def obtener_openaq_ciudad(session, ciudad):
 
 async def obtener_openaq_ciudades(ciudades):
     timeout = aiohttp.ClientTimeout(total=30)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    async with aiohttp.ClientSession(timeout=timeout, connector=_ssl_connector()) as session:
         tareas = [obtener_openaq_ciudad(session, ciudad) for ciudad in ciudades]
         resultados = await asyncio.gather(*tareas, return_exceptions=True)
         return resultados
@@ -308,7 +331,7 @@ async def obtener_thingspeak():
         url = f"https://api.thingspeak.com/channels/{THINGSPEAK_CHANNEL_ID}/feeds.json?{params}"
 
         timeout = aiohttp.ClientTimeout(total=25)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with aiohttp.ClientSession(timeout=timeout, connector=_ssl_connector()) as session:
             async with session.get(url) as response:
                 data = await _leer_json(response)
                 if response.status >= 400:

@@ -15,6 +15,19 @@ Dashboard de tráfico aéreo y condiciones ambientales con:
 
 ## Instalación básica
 
+En macOS y Linux suele usarse `python3` (el comando `python` a veces no existe). Activación del entorno:
+
+**macOS / Linux**
+
+```sh
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+streamlit run dashboard.py
+```
+
+**Windows (PowerShell o cmd)**
+
 ```sh
 python -m venv .venv
 .venv\Scripts\activate
